@@ -1,3 +1,4 @@
+// apps/web/src/app/page.tsx
 import Link from "next/link";
 
 export default function Home() {
