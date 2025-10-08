@@ -7,7 +7,7 @@
   "types": "dist/index.d.ts",
   "files": ["dist"],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
     "prepare": "pnpm run build"
   },
   "devDependencies": {

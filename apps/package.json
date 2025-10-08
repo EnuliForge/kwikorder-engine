@@ -1,8 +1,0 @@
-﻿{
-  "name": "kwikorder-engine",
-  "version": "0.0.0",
-  "private": true,
-  "license": "UNLICENSED",
-  "packageManager": "pnpm@9",
-  "workspaces": ["packages/*","apps/*"]
-}

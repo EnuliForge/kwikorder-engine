@@ -30,7 +30,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ ok:false, error:"invalid_stream" }, { status: 400 });
   }
 
-  // 1) create order_group
   const { data: og, error: ogErr } = await supa
     .from("order_groups")
     .insert({
@@ -43,14 +42,12 @@ export async function POST(req: NextRequest) {
     .single();
 
   if (ogErr) {
-    // surface unique violation nicely
     if (/duplicate key|unique constraint|order_code/i.test(ogErr.message)) {
       return NextResponse.json({ ok:false, error:"order_code_conflict" }, { status: 409 });
     }
     return NextResponse.json({ ok:false, error: ogErr.message }, { status: 500 });
   }
 
-  // 2) create initial ticket
   const { data: ticket, error: tErr } = await supa
     .from("tickets")
     .insert({
@@ -65,7 +62,6 @@ export async function POST(req: NextRequest) {
 
   if (tErr) return NextResponse.json({ ok:false, error: tErr.message }, { status: 500 });
 
-  // 3) optional line items
   if (Array.isArray(items) && items.length > 0) {
     const rows = items.map((it) => ({
       tenant_id: TENANT,

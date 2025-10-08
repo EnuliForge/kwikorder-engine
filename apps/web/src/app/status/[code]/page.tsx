@@ -3,8 +3,8 @@ import { headers } from "next/headers";
 export const dynamic = "force-dynamic";
 
 // Build an absolute base URL from the incoming request (works locally & on Vercel)
-function getBaseUrl() {
-  const h = headers();
+async function getBaseUrl() {
+  const h = await headers();
   const proto = h.get("x-forwarded-proto") ?? "http";
   const host =
     h.get("x-forwarded-host") ??
@@ -24,12 +24,15 @@ type Order = {
   }>;
 };
 
-export default async function StatusPage(props: {
-  params: Promise<{ code: string }>; // ⬅ params is async in this channel
+export default async function StatusPage({
+  params,
+}: {
+  params: Promise<{ code: string }>;
 }) {
-  const { code } = await props.params; // ⬅ await it
+  const { code } = await params;
 
-  const base = getBaseUrl();
+  // 👇 await getBaseUrl()
+  const base = await getBaseUrl();
   const res = await fetch(`${base}/api/v1/orders/${code}`, { cache: "no-store" });
   if (!res.ok) return <div className="p-6">Failed to load order.</div>;
 
@@ -55,3 +58,4 @@ export default async function StatusPage(props: {
     </div>
   );
 }
+
