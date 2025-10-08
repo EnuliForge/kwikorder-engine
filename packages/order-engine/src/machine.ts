@@ -1,4 +1,5 @@
 ﻿import type { Ticket, Transition, TicketStatus, DomainEvent } from "./types";
+import { safeUUID } from "./util/uuid";
 
 const legal: Record<TicketStatus, TicketStatus[]> = {
   received:  ["preparing","cancelled"],
@@ -14,8 +15,7 @@ export function transitionTicket(
   cmd: Transition,
   nowISO: string,
   idempotencyKey: string,
-  uuid: () => string = () =>
-    (globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`)
+  uuid: () => string = safeUUID
 ): { ticket: Ticket; events: DomainEvent[] } {
   const next = cmd.to;
   if (!legal[ticket.status].includes(next)) {
