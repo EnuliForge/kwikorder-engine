@@ -1,154 +1,137 @@
-// src/app/api/v1/orders/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { createClient } from "@supabase/supabase-js";
+import { supaServer } from "@/lib/supabase-server";
 
-/** Narrow types (keeps ESLint happy without piling on) */
-type Stream = "food" | "drinks";
+export const dynamic = "force-dynamic"; // ensure this stays a Serverless/Edge function
 
-type IncomingItem = {
-  stream: Stream;
-  sku?: string | null;
-  name?: string | null;
-  qty?: number;
-  unit_price_cents?: number | null;
-  notes?: string | null;
-  modifiers?: unknown; // JSON-able
-};
+// ----- Types (keep these narrow so we don't hit `any`) -----
+type OrderContext = "dine-in" | "takeaway" | "delivery";
 
-type Ticket = { id: string; stream: Stream };
-type OrderGroup = { id: string; order_code: string };
-type MenuItem = { sku: string; name: string; unit_price_cents: number | null };
+interface CreateOrderBody {
+  code: string;
+  context: OrderContext;
+}
 
-type LineItemInsert = {
-  ticket_id: string;
-  stream: Stream;
-  sku: string | null;
-  name: string; // NOT NULL
-  qty: number;
-  unit_price_cents: number;
-  total_cents: number;
-  notes: string | null;
-  modifiers_json: unknown | null;
-};
+interface DbOrder {
+  id: string;
+  tenant_id: string;
+  order_code: string;
+  context: OrderContext;
+  opened_at: string;
+  customer_confirmed_at: string | null;
+  closed_at: string | null;
+  metadata: Record<string, unknown>;
+}
 
+interface DbTicket {
+  id: string;
+  tenant_id: string;
+  order_group_id: string; // FK to orders.id
+  stream: string;
+  status: "received" | "preparing" | "ready" | "delivered" | "completed" | "cancelled";
+  created_at: string;
+  delivered_at: string | null;
+  completed_at: string | null;
+  metadata: Record<string, unknown>;
+}
+
+interface OkOrderResponse {
+  ok: true;
+  order: DbOrder & { tickets: DbTicket[] };
+}
+
+interface ErrResponse {
+  ok: false;
+  error: string;
+}
+
+// Constants we used before during bootstrap
+const TENANT_ID = "00000000-0000-0000-0000-000000000001";
+
+function bad(message: string, status = 400) {
+  const body: ErrResponse = { ok: false, error: message };
+  return NextResponse.json(body, { status });
+}
+
+function isCreateOrderBody(x: unknown): x is CreateOrderBody {
+  if (!x || typeof x !== "object") return false;
+  const b = x as Record<string, unknown>;
+  const codeOk = typeof b.code === "string" && b.code.trim().length > 0;
+  const contextOk =
+    b.context === "dine-in" || b.context === "takeaway" || b.context === "delivery";
+  return codeOk && contextOk;
+}
+
+// POST /api/v1/orders  → open/create an order with one initial ticket
 export async function POST(req: NextRequest) {
+  let parsed: unknown;
   try {
-    const body = (await req.json().catch(() => ({}))) as {
-      table_number?: number | null;
-      streams?: Stream[];
-      items?: IncomingItem[];
-    };
-
-    const table_number: number | null = body?.table_number ?? null;
-    const streams: Stream[] = Array.isArray(body?.streams) ? body.streams : [];
-    const items: IncomingItem[] = Array.isArray(body?.items) ? body.items : [];
-
-    if (items.length === 0) {
-      return NextResponse.json({ ok: false, error: "items required" }, { status: 400 });
-    }
-    if (streams.length === 0) {
-      return NextResponse.json({ ok: false, error: "streams required" }, { status: 400 });
-    }
-
-    const supa = createClient(
-      process.env.NEXT_PUBLIC_SUPABASE_URL!,
-      process.env.SUPABASE_SERVICE_ROLE_KEY!,
-      { auth: { persistSession: false } }
-    );
-
-    // 1) Create order group
-    const { data: og, error: ogErr } = await supa
-      .from("order_groups")
-      .insert([{ table_number }])
-      .select("id, order_code")
-      .single<OrderGroup>();
-    if (ogErr || !og) {
-      throw new Error(ogErr?.message ?? "order_groups insert failed");
-    }
-
-    // 2) Create tickets (one per stream)
-    const ticketRows = streams.map((s) => ({
-      order_group_id: og.id,
-      stream: s,
-      status: "received",
-    }));
-    const { data: tickets, error: tErr } = await supa
-      .from("tickets")
-      .insert(ticketRows)
-      .select("id, stream")
-      .returns<Ticket[]>();
-    if (tErr) throw new Error(tErr.message);
-
-    const ticketByStream = new Map<Stream, string>((tickets ?? []).map((t) => [t.stream, t.id]));
-
-    // 3) Minimal patch: resolve missing names from menu_items by sku
-    const skusNeedingLookup = items
-      .filter((i) => !i.name && i.sku)
-      .map((i) => String(i.sku));
-    const bySku = new Map<string, MenuItem>();
-    if (skusNeedingLookup.length > 0) {
-      const { data: menuRows, error: menuErr } = await supa
-        .from("menu_items")
-        .select("sku, name, unit_price_cents")
-        .in("sku", skusNeedingLookup)
-        .returns<MenuItem[]>();
-      if (menuErr) throw new Error(menuErr.message);
-      for (const r of menuRows ?? []) bySku.set(r.sku, r);
-    }
-
-    const itemsResolved: IncomingItem[] = items.map((i) => {
-      const m = i.sku ? bySku.get(String(i.sku)) : undefined;
-      return {
-        ...i,
-        name: i.name ?? m?.name ?? i.name,
-        unit_price_cents: i.unit_price_cents ?? m?.unit_price_cents ?? i.unit_price_cents ?? 0,
-      };
-    });
-
-    // Fail fast if we still don't have names
-    for (const i of itemsResolved) {
-      if (!i.name) {
-        return NextResponse.json(
-          { ok: false, error: `Missing name for sku=${i.sku ?? "null"}` },
-          { status: 400 }
-        );
-      }
-    }
-
-    // 4) Build line_items
-    const lineItems: LineItemInsert[] = itemsResolved.map((i) => {
-      const ticket_id = ticketByStream.get(i.stream);
-      if (!ticket_id) {
-        throw new Error(`No ticket for stream=${i.stream}`);
-      }
-      const qty = Number.isFinite(i.qty as number) ? Number(i.qty) : 1;
-      const unit_price_cents = Number(i.unit_price_cents ?? 0);
-      return {
-        ticket_id,
-        stream: i.stream,
-        sku: i.sku ?? null,
-        name: i.name as string, // guaranteed above
-        qty,
-        unit_price_cents,
-        total_cents: unit_price_cents * qty,
-        notes: i.notes ?? null,
-        modifiers_json: i.modifiers ?? null,
-      };
-    });
-
-    const { error: liErr } = await supa.from("line_items").insert(lineItems);
-    if (liErr) throw new Error(liErr.message);
-
-    return NextResponse.json({
-      ok: true,
-      order: {
-        order_group_id: og.id,
-        order_code: og.order_code,
-        tickets,
-      },
-    });
-  } catch (e) {
-    const message = e instanceof Error ? e.message : "server error";
-    return NextResponse.json({ ok: false, error: message }, { status: 500 });
+    parsed = await req.json();
+  } catch {
+    return bad("Body must be JSON");
   }
+  if (!isCreateOrderBody(parsed)) {
+    return bad(
+      "Invalid body. Expected { code: string; context: 'dine-in'|'takeaway'|'delivery' }"
+    );
+  }
+  const { code, context } = parsed;
+
+  const supa = supaServer();
+  const nowISO = new Date().toISOString();
+
+  // Upsert/open the order
+  const { data: orderRows, error: orderErr } = await supa
+    .from<DbOrder>("orders")
+    .insert([
+      {
+        id: crypto.randomUUID(),
+        tenant_id: TENANT_ID,
+        order_code: code,
+        context,
+        opened_at: nowISO,
+        customer_confirmed_at: null,
+        closed_at: null,
+        metadata: {},
+      },
+    ])
+    .select("*")
+    .limit(1);
+
+  if (orderErr || !orderRows || orderRows.length === 0) {
+    return bad(orderErr?.message ?? "Failed to create order", 500);
+  }
+  const order = orderRows[0];
+
+  // Create initial ticket in "kitchen" with status "received"
+  const { data: ticketRows, error: ticketErr } = await supa
+    .from<DbTicket>("tickets")
+    .insert([
+      {
+        id: crypto.randomUUID(),
+        tenant_id: TENANT_ID,
+        order_group_id: order.id,
+        stream: "kitchen",
+        status: "received",
+        created_at: nowISO,
+        delivered_at: null,
+        completed_at: null,
+        metadata: {},
+      },
+    ])
+    .select("*");
+
+  if (ticketErr || !ticketRows) {
+    return bad(ticketErr?.message ?? "Failed to create ticket", 500);
+  }
+
+  const body: OkOrderResponse = {
+    ok: true,
+    order: { ...order, tickets: ticketRows },
+  };
+  return NextResponse.json(body);
+}
+
+// (Optional) GET /api/v1/orders → simple health/availability check
+export async function GET() {
+  return NextResponse.json({ ok: true });
 }
