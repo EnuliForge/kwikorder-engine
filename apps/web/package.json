@@ -4,10 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "prebuild": "pnpm -w exec tsc -p packages/order-engine/tsconfig.json",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint",
-    "prebuild": "pnpm -w --filter @kwik/order-engine build"
+    "lint": "eslint"
   },
   "dependencies": {
     "@kwik/order-engine": "workspace:*",
