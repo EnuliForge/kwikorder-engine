@@ -1,0 +1,8 @@
+﻿{
+  "version": 2,
+  "builds": [
+    { "src": "apps/web/package.json", "use": "@vercel/next" }
+  ],
+  "installCommand": "pnpm -w install",
+  "buildCommand": "pnpm -w --filter @kwik/order-engine build && pnpm --filter web build"
+}
