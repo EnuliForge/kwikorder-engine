@@ -6,7 +6,7 @@ type Stream = "food" | "drinks";
 type IncomingItem = {
   stream: Stream;
   sku?: string | null;
-  name?: string | null;             // optional from client; we’ll resolve from menu_items if missing
+  name?: string | null;             // optional; we resolve from menu_items if missing
   qty?: number;
   unit_price_cents?: number | null; // optional override
   notes?: string | null;
@@ -54,7 +54,7 @@ export async function POST(req: NextRequest) {
     if (tErr) throw tErr;
 
     const ticketByStream = new Map<string, string>(
-      (tickets ?? []).map((t: any) => [t.stream, t.id])
+      (tickets ?? []).map((t: any) => [t.stream as string, t.id as string])
     );
 
     // 3) Resolve names/prices from menu_items for items missing name
@@ -66,17 +66,59 @@ export async function POST(req: NextRequest) {
         .select("sku, name, unit_price_cents")
         .in("sku", skus);
       if (menuErr) throw menuErr;
-      bySku = new Map((menuRows ?? []).map((r: any) => [r.sku, r]));
+      bySku = new Map((menuRows ?? []).map((r: any) => [r.sku as string, r]));
     }
 
     // 4) Build line_items with guaranteed non-null name
     const lineItems = items.map((i) => {
       const m = i.sku ? bySku.get(i.sku) : undefined;
+
       const name = i.name ?? m?.name;
       if (!name) {
         const e: any = new Error(`Missing name for sku=${i.sku ?? "null"}`);
         e.statusCode = 400;
         throw e;
       }
+
       const qty = Number.isFinite(i.qty as number) ? Number(i.qty) : 1;
-      const unit_price_cents = i.unit_price_cents ?? (m?.unit_pr_
+      const unit_price_cents =
+        i.unit_price_cents ?? (m?.unit_price_cents ?? 0); // <-- keep identifier intact
+      const ticket_id = ticketByStream.get(i.stream);
+      if (!ticket_id) {
+        const e: any = new Error(`No ticket for stream=${i.stream}`);
+        e.statusCode = 400;
+        throw e;
+      }
+
+      return {
+        ticket_id,
+        stream: i.stream,
+        sku: i.sku ?? null,
+        name, // NOT NULL
+        qty,
+        unit_price_cents,
+        total_cents: unit_price_cents ? unit_price_cents * qty : 0,
+        notes: i.notes ?? null,
+        modifiers_json: i.modifiers ?? null,
+      };
+    });
+
+    const { error: liErr } = await supa.from("line_items").insert(lineItems);
+    if (liErr) throw liErr;
+
+    return NextResponse.json({
+      ok: true,
+      order: {
+        order_group_id: og.id,
+        order_code: og.order_code,
+        tickets,
+      },
+    });
+  } catch (err: any) {
+    const status = Number.isFinite(err?.statusCode) ? err.statusCode : 500;
+    return NextResponse.json(
+      { ok: false, error: err?.message ?? "server error" },
+      { status }
+    );
+  }
+}
