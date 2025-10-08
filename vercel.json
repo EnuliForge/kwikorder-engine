@@ -4,5 +4,5 @@
     { "src": "apps/web/package.json", "use": "@vercel/next" }
   ],
   "installCommand": "pnpm -w install --prod=false --no-frozen-lockfile",
-  "buildCommand": "pnpm -w exec tsc -p packages/order-engine/tsconfig.json && pnpm --filter web build"
+  "buildCommand": "pnpm -w exec tsc -p packages/order-engine/tsconfig.json && pnpm -C apps/web install --prod=false --no-frozen-lockfile && pnpm -C apps/web run build"
 }
