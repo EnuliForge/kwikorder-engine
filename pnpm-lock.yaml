@@ -11,7 +11,7 @@ importers:
   apps/web:
     dependencies:
       '@kwik/order-engine':
-        specifier: workspace:*
+        specifier: file:../../packages/order-engine
         version: link:../../packages/order-engine
       '@supabase/supabase-js':
         specifier: ^2.74.0

@@ -7,10 +7,10 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "prebuild": "pnpm -w --filter @kwik/order-engine build"
+    "prebuild": "pnpm -C ../../packages/order-engine run build"
   },
   "dependencies": {
-    "@kwik/order-engine": "workspace:*",
+    "@kwik/order-engine": "file:../../packages/order-engine",
     "@supabase/supabase-js": "^2.74.0",
     "next": "15.5.4",
     "react": "19.1.0",
