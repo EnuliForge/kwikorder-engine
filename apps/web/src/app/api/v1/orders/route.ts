@@ -1,82 +1,82 @@
+// src/app/api/v1/orders/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import { supaServer } from "@/lib/supabase-server";
-import { newOrderCode } from "@/lib/order-code";
+import { createClient } from "@supabase/supabase-js";
 
-const TENANT = "00000000-0000-0000-0000-000000000001" as const;
-
-type Item = {
-  sku?: string;
-  name: string;
-  qty: number;
-  price_minor: number; // cents
-  modifiers?: unknown[];
-  notes?: string;
-  metadata?: Record<string, unknown>;
+type Stream = "food" | "drinks";
+type IncomingItem = {
+  stream: Stream;
+  sku?: string | null;
+  name?: string | null;             // optional from client; we’ll resolve from menu_items if missing
+  qty?: number;
+  unit_price_cents?: number | null; // optional override
+  notes?: string | null;
+  modifiers?: unknown;              // JSON-able blob
 };
 
 export async function POST(req: NextRequest) {
-  const supa = supaServer();
+  try {
+    const body = await req.json().catch(() => ({}));
+    const table_number: number | null = body?.table_number ?? null;
+    const streams: Stream[] = body?.streams ?? [];
+    const items: IncomingItem[] = body?.items ?? [];
 
-  const body = await req.json().catch(() => ({}));
-  const context = (body?.context ?? "dine-in") as "dine-in" | "room-service" | "pickup";
-  const stream = (body?.stream ?? "kitchen") as "kitchen" | "bar";
-  const items = (body?.items ?? []) as Item[];
-  const code = (body?.order_code as string | undefined) ?? newOrderCode();
-
-  if (!["dine-in", "room-service", "pickup"].includes(context)) {
-    return NextResponse.json({ ok:false, error:"invalid_context" }, { status: 400 });
-  }
-  if (!["kitchen","bar"].includes(stream)) {
-    return NextResponse.json({ ok:false, error:"invalid_stream" }, { status: 400 });
-  }
-
-  const { data: og, error: ogErr } = await supa
-    .from("order_groups")
-    .insert({
-      tenant_id: TENANT,
-      order_code: code,
-      context,
-      metadata: body?.metadata ?? {}
-    })
-    .select("*")
-    .single();
-
-  if (ogErr) {
-    if (/duplicate key|unique constraint|order_code/i.test(ogErr.message)) {
-      return NextResponse.json({ ok:false, error:"order_code_conflict" }, { status: 409 });
+    if (!Array.isArray(items) || items.length === 0) {
+      return NextResponse.json({ ok: false, error: "items required" }, { status: 400 });
     }
-    return NextResponse.json({ ok:false, error: ogErr.message }, { status: 500 });
-  }
+    if (!Array.isArray(streams) || streams.length === 0) {
+      return NextResponse.json({ ok: false, error: "streams required" }, { status: 400 });
+    }
 
-  const { data: ticket, error: tErr } = await supa
-    .from("tickets")
-    .insert({
-      tenant_id: TENANT,
+    const supa = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.SUPABASE_SERVICE_ROLE_KEY!, // server-side only
+      { auth: { persistSession: false } }
+    );
+
+    // 1) Create order group
+    const { data: og, error: ogErr } = await supa
+      .from("order_groups")
+      .insert([{ table_number }])
+      .select("id, order_code")
+      .single();
+    if (ogErr) throw ogErr;
+
+    // 2) Create tickets per stream
+    const ticketRows = streams.map((s) => ({
       order_group_id: og.id,
-      stream,
+      stream: s,
       status: "received",
-      metadata: body?.ticket_metadata ?? {}
-    })
-    .select("*")
-    .single();
-
-  if (tErr) return NextResponse.json({ ok:false, error: tErr.message }, { status: 500 });
-
-  if (Array.isArray(items) && items.length > 0) {
-    const rows = items.map((it) => ({
-      tenant_id: TENANT,
-      ticket_id: ticket.id,
-      sku: it.sku ?? null,
-      name: it.name,
-      qty: it.qty,
-      price_minor: it.price_minor,
-      modifiers: it.modifiers ?? [],
-      notes: it.notes ?? null,
-      metadata: it.metadata ?? {}
     }));
-    const { error: liErr } = await supa.from("line_items").insert(rows);
-    if (liErr) return NextResponse.json({ ok:false, error: liErr.message }, { status: 500 });
-  }
+    const { data: tickets, error: tErr } = await supa
+      .from("tickets")
+      .insert(ticketRows)
+      .select("id, stream");
+    if (tErr) throw tErr;
 
-  return NextResponse.json({ ok:true, order_code: og.order_code, order_group_id: og.id, ticket_id: ticket.id });
-}
+    const ticketByStream = new Map<string, string>(
+      (tickets ?? []).map((t: any) => [t.stream, t.id])
+    );
+
+    // 3) Resolve names/prices from menu_items for items missing name
+    const skus = items.map((i) => i.sku).filter(Boolean) as string[];
+    let bySku = new Map<string, { sku: string; name: string; unit_price_cents: number | null }>();
+    if (skus.length) {
+      const { data: menuRows, error: menuErr } = await supa
+        .from("menu_items")
+        .select("sku, name, unit_price_cents")
+        .in("sku", skus);
+      if (menuErr) throw menuErr;
+      bySku = new Map((menuRows ?? []).map((r: any) => [r.sku, r]));
+    }
+
+    // 4) Build line_items with guaranteed non-null name
+    const lineItems = items.map((i) => {
+      const m = i.sku ? bySku.get(i.sku) : undefined;
+      const name = i.name ?? m?.name;
+      if (!name) {
+        const e: any = new Error(`Missing name for sku=${i.sku ?? "null"}`);
+        e.statusCode = 400;
+        throw e;
+      }
+      const qty = Number.isFinite(i.qty as number) ? Number(i.qty) : 1;
+      const unit_price_cents = i.unit_price_cents ?? (m?.unit_pr_
