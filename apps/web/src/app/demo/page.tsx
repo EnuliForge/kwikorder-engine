@@ -1,32 +1,47 @@
-﻿import { transitionTicket } from "@kwik/order-engine";
+﻿"use client";
+import { useState } from "react";
 
-export const dynamic = "force-dynamic";
+export default function Demo() {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
-export default function DemoPage() {
-  const now = new Date().toISOString();
-
-  const ticket = {
-    id: "t1",
-    order_group_id: "og1",
-    stream: "kitchen" as const,
-    status: "ready" as const,
-    created_at: now,
-  };
-
-  const { ticket: after, events } = transitionTicket(
-    ticket,
-    { to: "delivered" },
-    now,
-    "demo-abc-123"
-  );
+  async function startDemo() {
+    setBusy(true);
+    setErr(null);
+    try {
+      const code = crypto.randomUUID().slice(0, 8).toUpperCase();
+      const res = await fetch("/api/v1/orders", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code, context: "dine-in" }),
+      });
+      const json = await res.json();
+      if (!json.ok) throw new Error(json.error || "Failed to start demo");
+      const orderCode: string = json.order.order_code;
+      location.href = `/status/${encodeURIComponent(orderCode)}`;
+    } catch (e: any) {
+      setErr(String(e?.message || e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <main style={{ padding: 24 }}>
-      <h1 style={{ fontWeight: 700, fontSize: 24 }}>Engine Demo</h1>
-      <pre style={{ background: "#111", color: "#0f0", padding: 16 }}>
-        {JSON.stringify({ before: ticket, after, events }, null, 2)}
-      </pre>
-      <p>Expected: status changes from <code>ready</code> → <code>delivered</code> and an event is emitted.</p>
+      <h1>Demo</h1>
+      <p>Click to create a new order and jump to its live status page.</p>
+      <button
+        disabled={busy}
+        onClick={startDemo}
+        style={{ padding: 12, cursor: busy ? "not-allowed" : "pointer" }}
+      >
+        {busy ? "Starting…" : "Start Demo Order"}
+      </button>
+      {err && (
+        <p style={{ color: "crimson", marginTop: 12 }}>
+          {err}
+        </p>
+      )}
     </main>
   );
 }
