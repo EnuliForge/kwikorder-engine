@@ -15,12 +15,31 @@ export default function Demo() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code, context: "dine-in" }),
       });
-      const json = await res.json();
-      if (!json.ok) throw new Error(json.error || "Failed to start demo");
-      const orderCode: string = json.order.order_code;
+
+      if (!res.ok) {
+        // Try to surface server error text if available
+        let msg = `HTTP ${res.status}`;
+        try {
+          const j = (await res.json()) as { ok?: boolean; error?: string };
+          if (j?.error) msg = j.error;
+        } catch { /* ignore parse errors */ }
+        throw new Error(msg);
+      }
+
+      const json = (await res.json()) as {
+        ok: boolean;
+        order: { order_code: string };
+      };
+
+      if (!json.ok || !json.order?.order_code) {
+        throw new Error("Failed to start demo");
+      }
+
+      const orderCode = json.order.order_code;
       location.href = `/status/${encodeURIComponent(orderCode)}`;
-    } catch (e: any) {
-      setErr(String(e?.message || e));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setErr(msg);
     } finally {
       setBusy(false);
     }
