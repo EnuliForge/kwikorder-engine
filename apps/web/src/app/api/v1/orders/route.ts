@@ -1,22 +1,22 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supaServer } from "@/lib/supabase-server";
 
-export const dynamic = "force-dynamic"; // ensure this stays a Serverless/Edge function
+export const dynamic = "force-dynamic";
 
-// ----- Types (keep these narrow so we don't hit `any`) -----
-type OrderContext = "dine-in" | "takeaway" | "delivery";
+// ---- Types (match your DB) ----
+type OrderContext = "dine-in" | "room-service" | "pickup";
 
 interface CreateOrderBody {
   code: string;
   context: OrderContext;
 }
 
-interface DbOrder {
+interface DbOrderGroup {
   id: string;
   tenant_id: string;
   order_code: string;
   context: OrderContext;
-  opened_at: string;
+  opened_at: string | null;               // default now()
   customer_confirmed_at: string | null;
   closed_at: string | null;
   metadata: Record<string, unknown>;
@@ -25,8 +25,8 @@ interface DbOrder {
 interface DbTicket {
   id: string;
   tenant_id: string;
-  order_group_id: string; // FK to orders.id
-  stream: string;
+  order_group_id: string; // FK to order_groups.id
+  stream: "kitchen" | "bar";
   status: "received" | "preparing" | "ready" | "delivered" | "completed" | "cancelled";
   created_at: string;
   delivered_at: string | null;
@@ -36,7 +36,7 @@ interface DbTicket {
 
 interface OkOrderResponse {
   ok: true;
-  order: DbOrder & { tickets: DbTicket[] };
+  order: DbOrderGroup & { tickets: DbTicket[] };
 }
 
 interface ErrResponse {
@@ -44,7 +44,7 @@ interface ErrResponse {
   error: string;
 }
 
-// Constants we used before during bootstrap
+// same tenant seed you used in SQL
 const TENANT_ID = "00000000-0000-0000-0000-000000000001";
 
 function bad(message: string, status = 400) {
@@ -56,12 +56,12 @@ function isCreateOrderBody(x: unknown): x is CreateOrderBody {
   if (!x || typeof x !== "object") return false;
   const b = x as Record<string, unknown>;
   const codeOk = typeof b.code === "string" && b.code.trim().length > 0;
-  const contextOk =
-    b.context === "dine-in" || b.context === "takeaway" || b.context === "delivery";
+  const ctx = b.context;
+  const contextOk = ctx === "dine-in" || ctx === "room-service" || ctx === "pickup";
   return codeOk && contextOk;
 }
 
-// POST /api/v1/orders  → open/create an order with one initial ticket
+// POST /api/v1/orders  → open/create an order_group with one initial ticket
 export async function POST(req: NextRequest) {
   let parsed: unknown;
   try {
@@ -71,67 +71,61 @@ export async function POST(req: NextRequest) {
   }
   if (!isCreateOrderBody(parsed)) {
     return bad(
-      "Invalid body. Expected { code: string; context: 'dine-in'|'takeaway'|'delivery' }"
+      "Invalid body. Expected { code: string; context: 'dine-in'|'room-service'|'pickup' }"
     );
   }
   const { code, context } = parsed;
 
   const supa = supaServer();
-  const nowISO = new Date().toISOString();
 
-  // Upsert/open the order
-  const { data: orderRows, error: orderErr } = await supa
-    .from<DbOrder>("orders")
+  // Insert order_group (let defaults fill opened_at, metadata)
+  const { data: ogRows, error: ogErr } = await supa
+    .from("order_groups")
     .insert([
       {
         id: crypto.randomUUID(),
         tenant_id: TENANT_ID,
         order_code: code,
         context,
-        opened_at: nowISO,
-        customer_confirmed_at: null,
-        closed_at: null,
-        metadata: {},
-      },
+        // opened_at, metadata use defaults from your schema
+      } satisfies Partial<DbOrderGroup> // we aren't setting every field; defaults handle the rest
     ])
     .select("*")
-    .limit(1);
+    .returns<DbOrderGroup[]>();
 
-  if (orderErr || !orderRows || orderRows.length === 0) {
-    return bad(orderErr?.message ?? "Failed to create order", 500);
+  if (ogErr) {
+    // common cases: unique violation on order_code; table name mismatch; RLS
+    return bad(`order_groups insert error: ${ogErr.message}`, 500);
   }
-  const order = orderRows[0];
+  const og = ogRows?.[0];
+  if (!og) return bad("order_groups insert returned no row", 500);
 
-  // Create initial ticket in "kitchen" with status "received"
+  // Create initial ticket in "kitchen" (status defaults to 'received', created_at defaults now())
+  const initialTicket: Partial<DbTicket> = {
+    id: crypto.randomUUID(),
+    tenant_id: TENANT_ID,
+    order_group_id: og.id,
+    stream: "kitchen",
+    // status / created_at / metadata default in DB
+  };
+
   const { data: ticketRows, error: ticketErr } = await supa
-    .from<DbTicket>("tickets")
-    .insert([
-      {
-        id: crypto.randomUUID(),
-        tenant_id: TENANT_ID,
-        order_group_id: order.id,
-        stream: "kitchen",
-        status: "received",
-        created_at: nowISO,
-        delivered_at: null,
-        completed_at: null,
-        metadata: {},
-      },
-    ])
-    .select("*");
+    .from("tickets")
+    .insert([initialTicket])
+    .select("*")
+    .returns<DbTicket[]>();
 
-  if (ticketErr || !ticketRows) {
-    return bad(ticketErr?.message ?? "Failed to create ticket", 500);
-  }
+  if (ticketErr) return bad(`tickets insert error: ${ticketErr.message}`, 500);
+  if (!ticketRows) return bad("tickets insert returned no rows", 500);
 
   const body: OkOrderResponse = {
     ok: true,
-    order: { ...order, tickets: ticketRows },
+    order: { ...og, tickets: ticketRows },
   };
   return NextResponse.json(body);
 }
 
-// (Optional) GET /api/v1/orders → simple health/availability check
+// Optional health check
 export async function GET() {
   return NextResponse.json({ ok: true });
 }
