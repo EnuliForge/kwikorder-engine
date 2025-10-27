@@ -240,11 +240,15 @@ export default function OrderClient({
       }),
     });
 
-    if (!res.ok) {
-      console.error(await res.text());
-      alert("There was a problem sending your order.");
-      return;
-    }
+   if (!res.ok) {
+  const errText = await res.text();
+  console.error("ORDER SUBMIT FAILED", res.status, errText);
+  alert(`There was a problem sending your order.\n${res.status}: ${errText}`);
+  return;
+}
+
+
+
 
     const data = await res.json();
     setCart([]);
