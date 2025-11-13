@@ -227,7 +227,7 @@ export default function OrderClient({
         tenant_id: tenantId,
         table_id: tableId,
         context: "dine-in",
-        notes: roundNote,
+        notes,
         cart: cart.map((line) => ({
           sku: line.sku,
           name: line.name,
@@ -235,7 +235,7 @@ export default function OrderClient({
           qty: line.qty,
           price_minor: line.final_price_minor,
           modifiers: line.modifiers,
-          notes: roundNote,
+          notes,
         })),
       }),
     });
@@ -247,12 +247,9 @@ export default function OrderClient({
   return;
 }
 
-
-
-
     const data = await res.json();
     setCart([]);
-    router.push(`/status/${data.table_id}`);
+    router.push(`/status/${data.table_id}?oc=${data.order_code}`);
   }
 
   // open modal OR auto-add

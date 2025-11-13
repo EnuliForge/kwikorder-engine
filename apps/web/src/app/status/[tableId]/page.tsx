@@ -51,8 +51,6 @@ type LineItem = {
 };
 
 // ---------- Helpers ----------
-
-// money formatter (minor units => "ZMW 95.00")
 function formatMoney(minor: number) {
   const kwacha = Math.floor(minor / 100);
   const ngwee = minor % 100;
@@ -60,69 +58,50 @@ function formatMoney(minor: number) {
   return `ZMW ${kwacha}.${ngweeStr}`;
 }
 
-// derive a single readable "status" for that order_group
 function deriveOverallStatus(tickets: Ticket[]): string {
   const states = new Set(tickets.map((t) => t.status));
-
-  if (states.has("received") || states.has("preparing")) {
-    return "Being prepared";
-  }
-  if (states.has("ready")) {
-    return "Ready to serve";
-  }
+  if (states.has("received") || states.has("preparing")) return "Being prepared";
+  if (states.has("ready")) return "Ready to serve";
   if (
     !states.has("received") &&
     !states.has("preparing") &&
     !states.has("ready") &&
-    (states.has("delivered") ||
-      states.has("completed") ||
-      states.has("cancelled"))
+    (states.has("delivered") || states.has("completed") || states.has("cancelled"))
   ) {
     return "Completed";
   }
-
   return "In progress";
 }
 
-// consider a single ticket "done" if it's delivered/completed/cancelled
 function ticketIsDone(status: TicketStatus) {
-  return (
-    status === "delivered" ||
-    status === "completed" ||
-    status === "cancelled"
-  );
+  return status === "delivered" || status === "completed" || status === "cancelled";
 }
 
-// consider a whole order_group "done" if ALL its tickets are done
 function orderGroupIsDone(tickets: Ticket[]): boolean {
-  if (tickets.length === 0) {
-    // if we somehow have no tickets we treat as done? or active?
-    // let's say: if no tickets, it's not done (it just got created).
-    return false;
-  }
+  if (tickets.length === 0) return false;
   return tickets.every((t) => ticketIsDone(t.status));
 }
 
 // ---------- Page Component ----------
-//
-// This page is now /status/[tableId], not /status/[code].
-//
-// We will:
-// 1. Get tableId from params
-// 2. Fetch ALL order_groups for that tableId
-// 3. For each order_group, fetch its tickets + line_items
-// 4. Filter out order_groups that are fully done
-// 5. Render a card per active order_group
-//
+// Shows ALL active orders for a table. If ?oc=ORDER_CODE is provided,
+// that order is highlighted (but we still render all).
 export default async function TableStatusPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ tableId: string }>;
+  searchParams: Promise<{ oc?: string | string[] }>;
 }) {
+  // ✅ Await the new async params/searchParams
   const { tableId } = await params;
+  const sp = await searchParams;
+  const requestedOc = (Array.isArray(sp.oc) ? sp.oc[0] : sp.oc || "")
+    .toUpperCase()
+    .trim();
+
   const supabase = supaServer();
 
-  // 1. Pull all order_groups for this table_id (newest first)
+  // 1) Get ALL order_groups for this table (newest first)
   const { data: orderGroups, error: ogErr } = await supabase
     .from("order_groups")
     .select("*")
@@ -130,19 +109,84 @@ export default async function TableStatusPage({
     .order("opened_at", { ascending: false })
     .returns<OrderGroup[]>();
 
-  if (ogErr) {
-    throw ogErr;
+  if (ogErr) throw ogErr;
+  if (!orderGroups || orderGroups.length === 0) notFound();
+
+  // Helper: build a renderable "card" from an order_group
+  async function buildCard(og: OrderGroup) {
+    const { data: ticketsRows, error: ticketsErr } = await supabase
+      .from("tickets")
+      .select("*")
+      .eq("order_group_id", og.id)
+      .order("created_at", { ascending: true })
+      .returns<Ticket[]>();
+    if (ticketsErr) throw ticketsErr;
+
+    const ticketsSafe = ticketsRows ?? [];
+    if (orderGroupIsDone(ticketsSafe)) return null; // skip completed groups
+
+    const ticketIds = ticketsSafe.map((t) => t.id);
+
+    let allLineItems: LineItem[] = [];
+    if (ticketIds.length > 0) {
+      const { data: lineItemsRows, error: lineItemsErr } = await supabase
+        .from("line_items")
+        .select("*")
+        .in("ticket_id", ticketIds)
+        .returns<LineItem[]>();
+      if (lineItemsErr) throw lineItemsErr;
+      allLineItems = lineItemsRows ?? [];
+    }
+
+    type FlatRow = {
+      sku: string | null;
+      name: string;
+      qty: number;
+      price_minor: number;
+      notes: string | null;
+      modifiers: unknown[];
+    };
+
+    const mergedRows: FlatRow[] = [];
+    itemLoop: for (const li of allLineItems) {
+      for (const row of mergedRows) {
+        const sameSku = row.sku !== null && li.sku !== null && row.sku === li.sku;
+        const bothNoSkuButSameIdent =
+          row.sku === null && li.sku === null && row.name === li.name && row.price_minor === li.price_minor;
+        const canMergeByCode = sameSku || bothNoSkuButSameIdent;
+        const sameNotes = row.notes === li.notes;
+        const sameModifiersJSON =
+          JSON.stringify(row.modifiers ?? []) === JSON.stringify(li.modifiers ?? []);
+        if (canMergeByCode && sameNotes && sameModifiersJSON) {
+          row.qty += li.qty;
+          continue itemLoop;
+        }
+      }
+      mergedRows.push({
+        sku: li.sku,
+        name: li.name,
+        qty: li.qty,
+        price_minor: li.price_minor,
+        notes: li.notes,
+        modifiers: li.modifiers,
+      });
+    }
+
+    const totalMinor = mergedRows.reduce((sum, row) => sum + row.qty * row.price_minor, 0);
+    const headlineStatus = deriveOverallStatus(ticketsSafe);
+    const specialNote = ticketsSafe.find((t) => t.metadata?.notes)?.metadata?.notes || null;
+
+    return {
+      orderGroup: og,
+      headlineStatus,
+      specialNote,
+      mergedRows,
+      totalMinor,
+    };
   }
 
-  if (!orderGroups || orderGroups.length === 0) {
-    // no orders ever for this table
-    notFound();
-  }
-
-  // We'll build an array of "cards" to render.
-  // Each card = 1 order_group with {headlineStatus, mergedItems, total, ...}
-
-  const cards: Array<{
+  // 2) Build cards for all active order groups
+  const cardsRaw: Array<{
     orderGroup: OrderGroup;
     headlineStatus: string;
     specialNote: string | null;
@@ -155,129 +199,30 @@ export default async function TableStatusPage({
       modifiers: unknown[];
     }>;
     totalMinor: number;
+    __highlight?: boolean;
   }> = [];
 
-  // We'll hydrate each order_group sequentially.
-  // (Could be parallel later, but this is fine for now)
   for (const og of orderGroups) {
-    // 2. Fetch tickets for this order_group
-    const { data: ticketsRows, error: ticketsErr } = await supabase
-      .from("tickets")
-      .select("*")
-      .eq("order_group_id", og.id)
-      .order("created_at", { ascending: true })
-      .returns<Ticket[]>();
-
-    if (ticketsErr) {
-      throw ticketsErr;
-    }
-
-    const ticketsSafe = ticketsRows ?? [];
-
-    // If all tickets are done, skip this order_group entirely (so it drops off the view)
-    if (orderGroupIsDone(ticketsSafe)) {
-      continue;
-    }
-
-    // 3. Fetch line items for this order_group's tickets
-    const ticketIds = ticketsSafe.map((t) => t.id);
-
-    let allLineItems: LineItem[] = [];
-    if (ticketIds.length > 0) {
-      const { data: lineItemsRows, error: lineItemsErr } = await supabase
-        .from("line_items")
-        .select("*")
-        .in("ticket_id", ticketIds)
-        .returns<LineItem[]>();
-
-      if (lineItemsErr) {
-        throw lineItemsErr;
-      }
-
-      allLineItems = lineItemsRows ?? [];
-    }
-
-    // 4. Merge items for guest display
-    //
-    // Rules for merging:
-    // - Only merge lines if they are literally the same item code.
-    //   We treat that as same sku OR same (name+price) when sku is null.
-    // - Notes/modifiers must match too. If they differ, keep separate lines.
-    //
-    type FlatRow = {
-      sku: string | null;
-      name: string;
-      qty: number;
-      price_minor: number;
-      notes: string | null;
-      modifiers: unknown[];
-    };
-
-    const mergedRows: FlatRow[] = [];
-
-    itemLoop: for (const li of allLineItems) {
-      for (const row of mergedRows) {
-        const sameSku =
-          row.sku !== null &&
-          li.sku !== null &&
-          row.sku === li.sku;
-
-        const bothNoSkuButSameIdent =
-          row.sku === null &&
-          li.sku === null &&
-          row.name === li.name &&
-          row.price_minor === li.price_minor;
-
-        const canMergeByCode = sameSku || bothNoSkuButSameIdent;
-
-        const sameNotes = row.notes === li.notes;
-
-        const sameModifiersJSON =
-          JSON.stringify(row.modifiers ?? []) ===
-          JSON.stringify(li.modifiers ?? []);
-
-        if (canMergeByCode && sameNotes && sameModifiersJSON) {
-          row.qty += li.qty;
-          continue itemLoop;
-        }
-      }
-
-      mergedRows.push({
-        sku: li.sku,
-        name: li.name,
-        qty: li.qty,
-        price_minor: li.price_minor,
-        notes: li.notes,
-        modifiers: li.modifiers,
-      });
-    }
-
-    const totalMinor = mergedRows.reduce(
-      (sum, row) => sum + row.qty * row.price_minor,
-      0
-    );
-
-    // 5. "headline status" = combined status of all tickets in that order_group
-    const headlineStatus = deriveOverallStatus(ticketsSafe);
-
-    // 6. specialNote = first ticket.metadata.notes (if any)
-    const specialNote =
-      ticketsSafe.find((t) => t.metadata?.notes)?.metadata?.notes || null;
-
-    // 7. Push card for rendering
-    cards.push({
-      orderGroup: og,
-      headlineStatus,
-      specialNote,
-      mergedRows,
-      totalMinor,
-    });
+    const built = await buildCard(og);
+    if (built) cardsRaw.push(built);
   }
 
-  // After building cards, if literally none are active, we 404
-  // (You could choose to render "You're all done!" instead.)
-  if (cards.length === 0) {
-    notFound();
+  if (cardsRaw.length === 0) notFound();
+
+  // 3) If ?oc provided, put that card first and set a highlight flag
+  const idx = requestedOc ? cardsRaw.findIndex((c) => c.orderGroup.order_code === requestedOc) : -1;
+  let ocMismatchNote: string | null = null;
+
+  const cards =
+    idx > -1
+      ? [cardsRaw[idx], ...cardsRaw.slice(0, idx), ...cardsRaw.slice(idx + 1)].map((c, i) => ({
+          ...c,
+          __highlight: i === 0,
+        }))
+      : cardsRaw.map((c) => ({ ...c, __highlight: false }));
+
+  if (requestedOc && idx === -1) {
+    ocMismatchNote = `Note: requested code ${requestedOc} not found for this table; showing all active orders instead.`;
   }
 
   // ---------- RENDER ----------
@@ -285,38 +230,33 @@ export default async function TableStatusPage({
     <main className="mx-auto max-w-md p-4 space-y-6 text-zinc-100 bg-black min-h-screen">
       {/* Table header / identity */}
       <header className="text-center space-y-1">
-        <div className="text-[11px] uppercase tracking-wide text-zinc-500">
-          TABLE
-        </div>
+        <div className="text-[11px] uppercase tracking-wide text-zinc-500">TABLE</div>
         <div className="text-xl font-semibold text-zinc-100 break-all">
           {cards[0]?.orderGroup.table_id ?? "—"}
         </div>
-        <div className="text-[12px] text-zinc-500">
-          This shows all active orders for this table.
-        </div>
+        <div className="text-[12px] text-zinc-500">This shows all active orders for this table.</div>
+        {ocMismatchNote && (
+          <div className="mt-2 text-[11px] text-amber-300">{ocMismatchNote}</div>
+        )}
       </header>
 
       {/* Active orders for this table */}
       {cards.map(
-        (
-          { orderGroup, headlineStatus, specialNote, mergedRows, totalMinor },
-          idx
-        ) => (
+        ({ orderGroup, headlineStatus, specialNote, mergedRows, totalMinor, __highlight }) => (
           <section
             key={orderGroup.id}
-            className="rounded-2xl border border-zinc-700 p-4 shadow-sm space-y-4"
+            className={[
+              "rounded-2xl border p-4 shadow-sm space-y-4",
+              __highlight ? "border-amber-400" : "border-zinc-700",
+            ].join(" ")}
           >
             {/* ORDER HEADER */}
             <div className="flex items-start justify-between">
               <div>
-                <div className="text-[11px] uppercase text-zinc-400 tracking-wide">
-                  ORDER CODE
-                </div>
-
+                <div className="text-[11px] uppercase text-zinc-400 tracking-wide">ORDER CODE</div>
                 <div className="text-lg font-semibold text-zinc-100 break-all">
                   {orderGroup.order_code}
                 </div>
-
                 <div className="mt-2 text-sm text-zinc-300">
                   {orderGroup.context === "dine-in"
                     ? "Dine-in"
@@ -324,7 +264,6 @@ export default async function TableStatusPage({
                     ? "Room service"
                     : "Pickup"}
                 </div>
-
                 <div className="mt-1 text-[11px] text-zinc-500">
                   Opened at{" "}
                   {new Date(orderGroup.opened_at).toLocaleString("en-GB", {
@@ -335,7 +274,6 @@ export default async function TableStatusPage({
                   })}
                 </div>
               </div>
-
               <div className="rounded-full border border-zinc-600 px-3 py-1 text-[11px] font-medium text-zinc-300 whitespace-nowrap">
                 {headlineStatus}
               </div>
@@ -343,40 +281,27 @@ export default async function TableStatusPage({
 
             {/* SPECIAL NOTE */}
             {specialNote ? (
-              <div className="text-[12px] text-zinc-400 italic">
-                “{specialNote}”
-              </div>
+              <div className="text-[12px] text-zinc-400 italic">“{specialNote}”</div>
             ) : null}
 
             {/* ITEMS */}
             {mergedRows.length > 0 ? (
               <ul className="space-y-3">
                 {mergedRows.map((row, i) => (
-                  <li
-                    key={i}
-                    className="flex items-start justify-between text-sm"
-                  >
+                  <li key={i} className="flex items-start justify-between text-sm">
                     <div>
                       <div className="font-medium text-zinc-100">
                         {row.qty}× {row.name}
                       </div>
-
                       {row.notes ? (
-                        <div className="text-[11px] text-zinc-500 italic">
-                          {row.notes}
-                        </div>
+                        <div className="text-[11px] text-zinc-500 italic">{row.notes}</div>
                       ) : null}
-
-                      {row.modifiers &&
-                      (row.modifiers as unknown[]).length > 0 ? (
+                      {row.modifiers && (row.modifiers as unknown[]).length > 0 ? (
                         <div className="text-[11px] text-zinc-500">
-                          {Array.isArray(row.modifiers)
-                            ? row.modifiers.join(", ")
-                            : ""}
+                          {Array.isArray(row.modifiers) ? row.modifiers.join(", ") : ""}
                         </div>
                       ) : null}
                     </div>
-
                     <div className="text-right text-sm text-zinc-300">
                       {formatMoney(row.qty * row.price_minor)}
                     </div>
@@ -384,9 +309,7 @@ export default async function TableStatusPage({
                 ))}
               </ul>
             ) : (
-              <div className="text-[12px] text-zinc-500 italic">
-                No items yet.
-              </div>
+              <div className="text-[12px] text-zinc-500 italic">No items yet.</div>
             )}
 
             {/* TOTAL */}
@@ -399,9 +322,7 @@ export default async function TableStatusPage({
 
       {/* CTA back to menu */}
       <a
-        href={`/order?table_id=${encodeURIComponent(
-          cards[0]?.orderGroup.table_id ?? ""
-        )}`}
+        href={`/order?table_id=${encodeURIComponent(cards[0]?.orderGroup.table_id ?? "")}`}
         className="block w-full text-center rounded-xl bg-zinc-100 text-black font-semibold py-3 text-base"
       >
         Order more
